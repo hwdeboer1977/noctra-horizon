@@ -1,0 +1,21 @@
+{
+  "name": "noctra-relayer",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Reads Chainlink prices on Base (step 1). Later: relays them to RelayedPriceOracle on Horizen.",
+  "scripts": {
+    "read": "tsx src/readOnce.ts",
+    "server": "tsx src/server.ts",
+    "typecheck": "tsc --noEmit"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "viem": "^2.21.0"
+  },
+  "devDependencies": {
+    "@types/node": "^22.7.0",
+    "tsx": "^4.19.0",
+    "typescript": "^5.6.0"
+  }
+}
