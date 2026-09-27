@@ -151,9 +151,8 @@ contract RelayedPriceOracle is IPriceOracle, Ownable {
         if (feedDecimals > 18 || maxAge == 0 || maxDeviationBps == 0 || maxDeviationBps > BPS) {
             revert InvalidConfig();
         }
-        assetConfig[asset] = AssetConfig({
-            feedDecimals: feedDecimals, maxAge: maxAge, maxDeviationBps: maxDeviationBps, enabled: true
-        });
+        assetConfig[asset] =
+            AssetConfig({feedDecimals: feedDecimals, maxAge: maxAge, maxDeviationBps: maxDeviationBps, enabled: true});
         emit AssetConfigured(asset, feedDecimals, maxAge, maxDeviationBps);
     }
 
@@ -185,10 +184,7 @@ contract RelayedPriceOracle is IPriceOracle, Ownable {
     /// @notice Submit one Chainlink round, exactly as read from `latestRoundData()` on Base.
     /// @return accepted True if this vote reached quorum AND the trusted price was updated.
     ///         False if still collecting votes, or if the round went to `pending` (tripped).
-    function submit(address asset, uint80 roundId, int256 answer, uint64 updatedAt)
-        external
-        returns (bool accepted)
-    {
+    function submit(address asset, uint80 roundId, int256 answer, uint64 updatedAt) external returns (bool accepted) {
         if (!isRelayer[msg.sender]) revert NotRelayer(msg.sender);
         AssetConfig memory cfg = assetConfig[asset];
         if (!cfg.enabled) revert AssetNotEnabled(asset);
