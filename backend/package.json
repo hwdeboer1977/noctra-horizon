@@ -3,10 +3,11 @@
   "version": "0.1.0",
   "private": true,
   "type": "module",
-  "description": "Reads Chainlink prices on Base (step 1). Later: relays them to RelayedPriceOracle on Horizen.",
+  "description": "Chainlink prices on Base -> RelayedPriceOracle on Horizen",
   "scripts": {
     "read": "tsx src/readOnce.ts",
     "server": "tsx src/server.ts",
+    "relay": "tsx src/relay.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

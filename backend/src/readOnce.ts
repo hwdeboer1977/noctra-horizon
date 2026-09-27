@@ -6,18 +6,14 @@ import { makeBaseClient, readFeed, readSequencer } from "./chainlink.js";
 async function main() {
   const client = makeBaseClient(process.env.BASE_RPC_URL ?? "https://mainnet.base.org");
 
-  // Start ALL reads in the same tick so viem merges them into a single multicall.
-  const [seq, ...readings] = await Promise.all([
-    readSequencer(client, SEQUENCER_UPTIME_FEED, SEQUENCER_GRACE_PERIOD_SECONDS),
-    ...FEEDS.map((cfg) => readFeed(client, cfg)),
-  ]);
-
+  const seq = await readSequencer(client, SEQUENCER_UPTIME_FEED, SEQUENCER_GRACE_PERIOD_SECONDS);
   console.log(
     `Base sequencer: ${seq.up ? "UP" : "DOWN"} for ${seq.sinceSeconds}s` +
       (seq.inGracePeriod ? " (in grace period, prices not yet trusted)" : ""),
   );
 
-  for (const r of readings) {
+  for (const cfg of FEEDS) {
+    const r = await readFeed(client, cfg);
     console.log(
       `${r.description.padEnd(11)} $${r.price.padEnd(14)} round ${r.roundId}  ` +
         `updated ${new Date(Number(r.updatedAt) * 1000).toISOString()} (${r.ageSeconds}s ago)  ` +
@@ -27,8 +23,6 @@ async function main() {
 }
 
 main().catch((err) => {
-  // Short message instead of viem's full dump; set DEBUG=1 for the whole error.
-  if (process.env.DEBUG) console.error(err);
-  else console.error(`Error: ${err?.shortMessage ?? err?.message ?? err}${err?.details ? ` (${err.details})` : ""}`);
+  console.error(err);
   process.exit(1);
 });

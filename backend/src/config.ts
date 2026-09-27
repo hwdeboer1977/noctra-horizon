@@ -10,6 +10,7 @@ export interface FeedConfig {
   symbol: string; // our own label
   address: Address; // Chainlink proxy on Base
   expectedDescription: string; // what description() must return
+  horizenAssetEnv: string; // env var holding the token address on Horizen (oracle asset key)
 }
 
 export const FEEDS: FeedConfig[] = [
@@ -17,11 +18,13 @@ export const FEEDS: FeedConfig[] = [
     symbol: "ETH",
     address: "0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70",
     expectedDescription: "ETH / USD",
+    horizenAssetEnv: "HORIZEN_ASSET_ETH",
   },
   {
     symbol: "USDC",
     address: "0x7e860098F58bBFC8648a4311b374B1D669a2bc6B",
     expectedDescription: "USDC / USD",
+    horizenAssetEnv: "HORIZEN_ASSET_USDC",
   },
 ];
 

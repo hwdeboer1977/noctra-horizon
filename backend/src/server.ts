@@ -27,24 +27,19 @@ const state: {
 
 async function poll() {
   try {
-    // Start all reads in the same tick -> one multicall request per poll.
-    const [seq, ...readings] = await Promise.all([
-      readSequencer(client, SEQUENCER_UPTIME_FEED, SEQUENCER_GRACE_PERIOD_SECONDS),
-      ...FEEDS.map((cfg) => readFeed(client, cfg)),
-    ]);
-    state.sequencer = seq;
-    for (const r of readings) {
-      const prev = state.readings[r.symbol];
+    state.sequencer = await readSequencer(client, SEQUENCER_UPTIME_FEED, SEQUENCER_GRACE_PERIOD_SECONDS);
+    for (const cfg of FEEDS) {
+      const r = await readFeed(client, cfg);
+      const prev = state.readings[cfg.symbol];
       if (!prev || prev.roundId !== r.roundId) {
         console.log(`[${new Date().toISOString()}] ${r.description} new round ${r.roundId}: $${r.price}`);
       }
-      state.readings[r.symbol] = r;
+      state.readings[cfg.symbol] = r;
     }
     state.lastPollAt = new Date().toISOString();
     state.lastError = undefined;
   } catch (err) {
-    const e = err as { shortMessage?: string; details?: string; message?: string };
-    state.lastError = `${e.shortMessage ?? e.message ?? String(err)}${e.details ? ` (${e.details})` : ""}`;
+    state.lastError = err instanceof Error ? err.message : String(err);
     console.error(`[${new Date().toISOString()}] poll failed: ${state.lastError}`);
   }
 }

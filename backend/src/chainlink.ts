@@ -21,18 +21,8 @@ export const aggregatorV3Abi = [
   { type: "function", name: "description", stateMutability: "view", inputs: [], outputs: [{ type: "string" }] },
 ] as const;
 
-/**
- * `batch.multicall`: viem collects all readContract calls made in the same tick and
- * sends them as ONE eth_call to Multicall3 on Base. Reading 2 feeds + sequencer
- * (7 reads) becomes a single RPC request, which keeps us under public rate limits.
- * `retryCount/retryDelay`: back off and retry on transient errors like "over rate limit".
- */
 export function makeBaseClient(rpcUrl: string): PublicClient {
-  return createPublicClient({
-    chain: base,
-    batch: { multicall: true },
-    transport: http(rpcUrl, { retryCount: 5, retryDelay: 1000 }),
-  }) as PublicClient;
+  return createPublicClient({ chain: base, transport: http(rpcUrl) }) as PublicClient;
 }
 
 /**
@@ -53,7 +43,7 @@ export interface FeedReading {
 }
 
 export async function readFeed(client: PublicClient, cfg: FeedConfig): Promise<FeedReading> {
-  // Three reads in parallel; with batch.multicall they are merged into one request.
+  // Three reads in parallel. (A multicall would make it one RPC request.)
   const [description, decimals, round] = await Promise.all([
     client.readContract({ address: cfg.address, abi: aggregatorV3Abi, functionName: "description" }),
     client.readContract({ address: cfg.address, abi: aggregatorV3Abi, functionName: "decimals" }),
