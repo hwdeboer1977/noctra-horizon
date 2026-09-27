@@ -8,6 +8,7 @@
     "read": "tsx src/readOnce.ts",
     "server": "tsx src/server.ts",
     "relay": "tsx src/relay.ts",
+    "liquidate": "tsx src/liquidator.ts",
     "typecheck": "tsc --noEmit"
   },
   "dependencies": {

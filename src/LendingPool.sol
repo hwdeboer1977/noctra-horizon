@@ -9,9 +9,18 @@ import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol
 import {Math} from "@openzeppelin/contracts/utils/math/Math.sol";
 import {IPriceOracle} from "./IPriceOracle.sol";
 
-/// @title LendingPool — step 4: interest
-/// @notice Supply, withdraw, borrow, repay, and now: borrowers pay interest,
-///         suppliers earn it, and a reserve factor goes to the treasury.
+/// @title LendingPool — step 5: liquidations
+/// @notice Supply, withdraw, borrow, repay with interest, and liquidations:
+///         anyone can repay part of an unhealthy position's debt and receive the
+///         borrower's collateral plus a bonus.
+///
+///         TWO RATIOS PER COLLATERAL ASSET:
+///         - LTV (e.g. 75%): how much you may BORROW against it. Checked on borrow/withdraw.
+///         - Liquidation threshold (e.g. 80%): when you can be LIQUIDATED. Always > LTV,
+///           so a fresh position at max LTV has a buffer before it is liquidatable.
+///
+///         HEALTH FACTOR = sum(collateral value x liquidation threshold) / sum(debt value)
+///           HF >= 1 : safe          HF < 1 : liquidatable
 ///
 ///         HOW INTEREST WORKS (no loops over users):
 ///         - Each asset has two global indices that start at 1.0 (RAY = 1e27):
@@ -27,8 +36,9 @@ import {IPriceOracle} from "./IPriceOracle.sol";
 ///           U >  optimal: borrowRate = base + slope1 + slope2 * (U - optimal) / (1 - optimal)
 ///           supplyRate  = borrowRate * U * (1 - reserveFactor)
 ///
-/// @dev    Not yet: liquidations. Interest now makes debt GROW, so without liquidations
-///         positions drift towards (and past) their limit over time.
+/// @dev    Known gap: BAD DEBT. If collateral is worth less than the debt, a liquidation
+///         seizes all collateral and the rest of the debt stays on the books with nothing
+///         behind it. Suppliers implicitly absorb it. No write-off / reserve fund yet.
 contract LendingPool is Ownable, ReentrancyGuard {
     using SafeERC20 for IERC20;
 
@@ -45,10 +55,20 @@ contract LendingPool is Ownable, ReentrancyGuard {
         uint16 reserveFactorBps; // share of interest to the treasury, e.g. 1000 = 10%
     }
 
+    /// @notice Risk parameters per asset, set by the owner.
+    struct RiskParams {
+        uint16 ltvBps; // max borrow power per $1 of this collateral, e.g. 7500 = 75%
+        uint16 liqThresholdBps; // collateral weight in the health factor, e.g. 8000 = 80%
+        uint16 liqBonusBps; // extra collateral a liquidator receives, e.g. 750 = 7.5%
+        bool borrowEnabled; // can be borrowed
+    }
+
     struct AssetConfig {
         bool supported;
         bool borrowEnabled;
-        uint16 ltvBps; // max borrow power per $1 of this collateral, e.g. 7500 = 75%
+        uint16 ltvBps;
+        uint16 liqThresholdBps;
+        uint16 liqBonusBps;
         uint8 decimals; // token decimals, read once at listing
     }
 
@@ -63,9 +83,21 @@ contract LendingPool is Ownable, ReentrancyGuard {
 
     /// @notice A user's position valued in USD, 1e18 scale, including accrued interest.
     struct AccountData {
-        uint256 collateralValue;
-        uint256 borrowPower;
+        uint256 collateralValue; // unweighted
+        uint256 borrowPower; // collateral x LTV
+        uint256 liquidationCollateral; // collateral x liquidation threshold
         uint256 debtValue;
+        uint256 healthFactor; // 1e18 = 1.0; type(uint256).max if no debt
+    }
+
+    /// @dev Scratch space for liquidate() (avoids "stack too deep").
+    struct LiqVars {
+        uint256 userDebtScaled;
+        uint256 userCollScaled;
+        uint256 debtCovered;
+        uint256 collateralSeized;
+        uint256 debtScaledBurn;
+        uint256 collScaledMove;
     }
 
     uint256 internal constant RAY = 1e27;
@@ -75,6 +107,11 @@ contract LendingPool is Ownable, ReentrancyGuard {
     uint256 internal constant MAX_ASSETS = 10;
     /// @dev Sanity cap for the admin: 1000% APR max borrow rate.
     uint256 internal constant MAX_RATE = 10 * RAY;
+    uint256 internal constant WAD = 1e18;
+    /// @dev Above this HF a liquidator may repay at most CLOSE_FACTOR of the debt per call;
+    ///      below it, the whole debt (the position is too far gone to close in halves).
+    uint256 internal constant FULL_LIQUIDATION_HF = 0.95e18;
+    uint256 internal constant CLOSE_FACTOR_BPS = 5_000;
 
     // ---------------------------------------------------------------------
     // Storage
@@ -98,27 +135,39 @@ contract LendingPool is Ownable, ReentrancyGuard {
 
     event OracleSet(address indexed oracle);
     event TreasurySet(address indexed treasury);
-    event AssetAdded(address indexed asset, uint16 ltvBps, bool borrowEnabled);
-    event AssetConfigUpdated(address indexed asset, uint16 ltvBps, bool borrowEnabled);
+    event AssetAdded(address indexed asset);
+    event RiskParamsSet(
+        address indexed asset, uint16 ltvBps, uint16 liqThresholdBps, uint16 liqBonusBps, bool borrowEnabled
+    );
     event RateModelSet(address indexed asset);
     event Accrued(address indexed asset, uint256 liquidityIndex, uint256 borrowIndex, uint256 treasuryScaled);
     event Supplied(address indexed asset, address indexed user, uint256 amount);
     event Withdrawn(address indexed asset, address indexed user, uint256 amount);
     event Borrowed(address indexed asset, address indexed user, uint256 amount);
     event Repaid(address indexed asset, address indexed user, uint256 amount);
+    event Liquidated(
+        address indexed user,
+        address indexed liquidator,
+        address collateralAsset,
+        address debtAsset,
+        uint256 debtCovered,
+        uint256 collateralSeized,
+        bool receivedUnderlying
+    );
 
     error ZeroAddress();
     error ZeroAmount();
     error AssetNotSupported(address asset);
     error AssetAlreadySupported(address asset);
     error TooManyAssets();
-    error InvalidLtv(uint256 ltvBps);
+    error InvalidRiskParams();
     error InvalidRateModel();
     error BorrowNotEnabled(address asset);
     error InsufficientBalance(uint256 available, uint256 requested);
     error InsufficientLiquidity(uint256 available, uint256 requested);
     error InsufficientCollateral(uint256 borrowPower, uint256 debtValue);
     error NoDebt(address asset);
+    error PositionHealthy(uint256 healthFactor);
 
     // ---------------------------------------------------------------------
     // Constructor
@@ -152,15 +201,20 @@ contract LendingPool is Ownable, ReentrancyGuard {
         emit TreasurySet(treasury_);
     }
 
-    function addAsset(address asset, uint16 ltvBps, bool borrowEnabled, RateModel calldata model) external onlyOwner {
+    function addAsset(address asset, RiskParams calldata risk, RateModel calldata model) external onlyOwner {
         if (asset == address(0)) revert ZeroAddress();
         if (assetConfig[asset].supported) revert AssetAlreadySupported(asset);
         if (assetList.length >= MAX_ASSETS) revert TooManyAssets();
-        if (ltvBps > MAX_LTV_BPS) revert InvalidLtv(ltvBps);
+        _validateRiskParams(risk);
         _validateRateModel(model);
 
         assetConfig[asset] = AssetConfig({
-            supported: true, borrowEnabled: borrowEnabled, ltvBps: ltvBps, decimals: IERC20Metadata(asset).decimals()
+            supported: true,
+            borrowEnabled: risk.borrowEnabled,
+            ltvBps: risk.ltvBps,
+            liqThresholdBps: risk.liqThresholdBps,
+            liqBonusBps: risk.liqBonusBps,
+            decimals: IERC20Metadata(asset).decimals()
         });
         rateModel[asset] = model;
         reserve[asset] = ReserveState({
@@ -172,16 +226,21 @@ contract LendingPool is Ownable, ReentrancyGuard {
             lastUpdate: uint40(block.timestamp)
         });
         assetList.push(asset);
-        emit AssetAdded(asset, ltvBps, borrowEnabled);
+        emit AssetAdded(asset);
+        emit RiskParamsSet(asset, risk.ltvBps, risk.liqThresholdBps, risk.liqBonusBps, risk.borrowEnabled);
         emit RateModelSet(asset);
     }
 
-    function setAssetConfig(address asset, uint16 ltvBps, bool borrowEnabled) external onlyOwner {
+    /// @dev Lowering the liquidation threshold can make existing positions liquidatable
+    ///      instantly. Announce such changes (and later: put them behind a timelock).
+    function setRiskParams(address asset, RiskParams calldata risk) external onlyOwner {
         AssetConfig storage cfg = _supported(asset);
-        if (ltvBps > MAX_LTV_BPS) revert InvalidLtv(ltvBps);
-        cfg.ltvBps = ltvBps;
-        cfg.borrowEnabled = borrowEnabled;
-        emit AssetConfigUpdated(asset, ltvBps, borrowEnabled);
+        _validateRiskParams(risk);
+        cfg.ltvBps = risk.ltvBps;
+        cfg.liqThresholdBps = risk.liqThresholdBps;
+        cfg.liqBonusBps = risk.liqBonusBps;
+        cfg.borrowEnabled = risk.borrowEnabled;
+        emit RiskParamsSet(asset, risk.ltvBps, risk.liqThresholdBps, risk.liqBonusBps, risk.borrowEnabled);
     }
 
     /// @notice Change the rate model. Accrues FIRST, so the old rates apply to the
@@ -294,6 +353,107 @@ contract LendingPool is Ownable, ReentrancyGuard {
         IERC20(asset).safeTransferFrom(msg.sender, address(this), amount);
         emit Repaid(asset, msg.sender, amount);
         return amount;
+    }
+
+    // ---------------------------------------------------------------------
+    // Liquidation
+    // ---------------------------------------------------------------------
+
+    /// @notice Repay part of an unhealthy position's debt and receive its collateral + bonus.
+    ///
+    ///         Example: Bob owes 2,250 USDC against 1 WETH. ETH falls to $2,750, so
+    ///         HF = 2,750 x 80% / 2,250 = 0.98 < 1. A liquidator repays 1,125 USDC (50%)
+    ///         and receives 1,125 x 1.075 / 2,750 = 0.4398 WETH ($1,209.38): an $84 profit.
+    ///
+    /// @param debtToCover        Upper bound. Clamped to the close factor (50% of the debt,
+    ///                           or 100% if HF < 0.95) and to what the collateral can pay for.
+    /// @param receiveUnderlying  true: receive collateral tokens (needs free cash in that
+    ///                           reserve). false: receive it as a supply position in the pool.
+    function liquidate(
+        address collateralAsset,
+        address debtAsset,
+        address user,
+        uint256 debtToCover,
+        bool receiveUnderlying
+    ) external nonReentrant returns (uint256 debtCovered, uint256 collateralSeized) {
+        _supported(collateralAsset);
+        _supported(debtAsset);
+        if (debtToCover == 0) revert ZeroAmount();
+        ReserveState storage cr = _accrue(collateralAsset);
+        ReserveState storage dr = _accrue(debtAsset);
+
+        LiqVars memory v = _computeLiquidation(collateralAsset, debtAsset, user, debtToCover);
+        debtCovered = v.debtCovered;
+        collateralSeized = v.collateralSeized;
+
+        // Debt side: burn the borrower's debt; the repaid tokens become cash.
+        scaledDebtOf[debtAsset][user] = v.userDebtScaled - v.debtScaledBurn;
+        dr.totalScaledDebt -= v.debtScaledBurn;
+        dr.cash += debtCovered;
+
+        // Collateral side: take it from the borrower.
+        scaledSupplyOf[collateralAsset][user] = v.userCollScaled - v.collScaledMove;
+        if (receiveUnderlying) {
+            if (collateralSeized > cr.cash) revert InsufficientLiquidity(cr.cash, collateralSeized);
+            cr.totalScaledSupply -= v.collScaledMove;
+            cr.cash -= collateralSeized;
+        } else {
+            scaledSupplyOf[collateralAsset][msg.sender] += v.collScaledMove; // total unchanged
+        }
+
+        IERC20(debtAsset).safeTransferFrom(msg.sender, address(this), debtCovered);
+        if (receiveUnderlying) IERC20(collateralAsset).safeTransfer(msg.sender, collateralSeized);
+
+        emit Liquidated(user, msg.sender, collateralAsset, debtAsset, debtCovered, collateralSeized, receiveUnderlying);
+    }
+
+    /// @dev Bookkeeping math for liquidate(). Assumes both reserves are accrued.
+    function _computeLiquidation(address collateralAsset, address debtAsset, address user, uint256 debtToCover)
+        internal
+        view
+        returns (LiqVars memory v)
+    {
+        uint256 hf = _accountData(user).healthFactor;
+        if (hf >= WAD) revert PositionHealthy(hf);
+
+        v.userDebtScaled = scaledDebtOf[debtAsset][user];
+        if (v.userDebtScaled == 0) revert NoDebt(debtAsset);
+        uint256 borrowIndex = reserve[debtAsset].borrowIndex;
+        uint256 userDebt = _rayMulUp(v.userDebtScaled, borrowIndex);
+
+        // 1. Close factor
+        uint256 maxClose = hf < FULL_LIQUIDATION_HF ? userDebt : Math.mulDiv(userDebt, CLOSE_FACTOR_BPS, BPS);
+        v.debtCovered = debtToCover > maxClose ? maxClose : debtToCover;
+
+        // 2. Collateral to seize: debt value x (1 + bonus), in collateral units
+        (uint256 num, uint256 den) = _seizeRatio(collateralAsset, debtAsset);
+        v.collateralSeized = Math.mulDiv(v.debtCovered, num, den);
+
+        // 3. Not enough of this collateral: seize all of it, cover proportionally less.
+        //    Debt left with no collateral behind it is BAD DEBT (see contract notes).
+        uint256 liquidityIndex = reserve[collateralAsset].liquidityIndex;
+        v.userCollScaled = scaledSupplyOf[collateralAsset][user];
+        uint256 userColl = _rayMulDown(v.userCollScaled, liquidityIndex);
+        if (v.collateralSeized > userColl) {
+            v.collateralSeized = userColl;
+            v.debtCovered = Math.mulDiv(userColl, den, num);
+        }
+        if (v.debtCovered == 0 || v.collateralSeized == 0) revert ZeroAmount();
+
+        // 4. Scaled amounts (rounding in the pool's favour)
+        v.debtScaledBurn = v.debtCovered >= userDebt ? v.userDebtScaled : _rayDivDown(v.debtCovered, borrowIndex);
+        v.collScaledMove =
+            v.collateralSeized == userColl ? v.userCollScaled : _rayDivUp(v.collateralSeized, liquidityIndex);
+        if (v.collScaledMove > v.userCollScaled) v.collScaledMove = v.userCollScaled;
+    }
+
+    /// @dev collateral units = debt units x num / den, where
+    ///        num = priceDebt x (1 + bonus) x 10^collDecimals
+    ///        den = priceColl x 1           x 10^debtDecimals
+    function _seizeRatio(address collateralAsset, address debtAsset) internal view returns (uint256 num, uint256 den) {
+        AssetConfig storage cc = assetConfig[collateralAsset];
+        num = oracle.getPrice(debtAsset) * (BPS + cc.liqBonusBps) * (10 ** cc.decimals);
+        den = oracle.getPrice(collateralAsset) * BPS * (10 ** assetConfig[debtAsset].decimals);
     }
 
     /// @notice Anyone can move the indices forward (e.g. a keeper during quiet periods,
@@ -424,6 +584,15 @@ contract LendingPool is Ownable, ReentrancyGuard {
         return Math.mulDiv(totalDebt, RAY, cash + totalDebt);
     }
 
+    /// @dev LTV <= threshold < 100%, and liquidating at HF = 1 must not pay out more
+    ///      collateral than exists: threshold x (1 + bonus) < 100%. Otherwise every
+    ///      liquidation would create bad debt.
+    function _validateRiskParams(RiskParams calldata r) internal pure {
+        if (r.ltvBps > MAX_LTV_BPS) revert InvalidRiskParams();
+        if (r.ltvBps > r.liqThresholdBps || r.liqThresholdBps >= BPS) revert InvalidRiskParams();
+        if (uint256(r.liqThresholdBps) * (BPS + r.liqBonusBps) >= BPS * BPS) revert InvalidRiskParams();
+    }
+
     function _validateRateModel(RateModel calldata m) internal pure {
         if (m.optimalUtil == 0 || m.optimalUtil >= RAY) revert InvalidRateModel();
         if (m.reserveFactorBps > BPS) revert InvalidRateModel();
@@ -453,11 +622,13 @@ contract LendingPool is Ownable, ReentrancyGuard {
                 uint256 value = Math.mulDiv(_rayMulDown(sSupply, li), price, unit);
                 a.collateralValue += value;
                 a.borrowPower += Math.mulDiv(value, cfg.ltvBps, BPS);
+                a.liquidationCollateral += Math.mulDiv(value, cfg.liqThresholdBps, BPS);
             }
             if (sDebt != 0) {
                 a.debtValue += Math.mulDiv(_rayMulUp(sDebt, bi), price, unit, Math.Rounding.Ceil);
             }
         }
+        a.healthFactor = a.debtValue == 0 ? type(uint256).max : Math.mulDiv(a.liquidationCollateral, WAD, a.debtValue);
     }
 
     function _requireBorrowCapacity(address user) internal view {

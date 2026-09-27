@@ -64,6 +64,21 @@ export const relayedOracleAbi = [
     ],
   },
   { type: "function", name: "tripped", stateMutability: "view", inputs: [{ name: "asset", type: "address" }], outputs: [{ type: "bool" }] },
+  { type: "function", name: "getPrice", stateMutability: "view", inputs: [{ name: "asset", type: "address" }], outputs: [{ type: "uint256" }] },
+  { type: "function", name: "quorum", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
+  // Custom errors, so viem can decode WHY getPrice reverted.
+  { type: "error", name: "AssetNotEnabled", inputs: [{ name: "asset", type: "address" }] },
+  { type: "error", name: "CircuitBreakerActive", inputs: [{ name: "asset", type: "address" }] },
+  { type: "error", name: "NoPrice", inputs: [{ name: "asset", type: "address" }] },
+  {
+    type: "error",
+    name: "StalePrice",
+    inputs: [
+      { name: "asset", type: "address" },
+      { name: "updatedAt", type: "uint256" },
+      { name: "maxAge", type: "uint256" },
+    ],
+  },
   { type: "function", name: "epoch", stateMutability: "view", inputs: [], outputs: [{ type: "uint256" }] },
   { type: "function", name: "isRelayer", stateMutability: "view", inputs: [{ name: "r", type: "address" }], outputs: [{ type: "bool" }] },
   {
@@ -78,10 +93,20 @@ export const relayedOracleAbi = [
   },
 ] as const;
 
+/** Local anvil node (`anvil`), for end-to-end tests of the bots. */
+export const localAnvil = defineChain({
+  id: 31337,
+  name: "Anvil",
+  nativeCurrency: { name: "Ether", symbol: "ETH", decimals: 18 },
+  rpcUrls: { default: { http: ["http://127.0.0.1:8545"] } },
+  testnet: true,
+});
+
 export function pickChain(name: string) {
   if (name === "testnet") return horizenTestnet;
   if (name === "mainnet") return horizenMainnet;
-  throw new Error(`HORIZEN_NETWORK must be "testnet" or "mainnet", got "${name}"`);
+  if (name === "local") return localAnvil;
+  throw new Error(`HORIZEN_NETWORK must be "testnet", "mainnet" or "local", got "${name}"`);
 }
 
 export function makeHorizenClients(network: string, rpcUrl: string | undefined, privateKey?: Hex) {

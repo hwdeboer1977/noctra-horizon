@@ -35,6 +35,15 @@ contract LendingPoolTest is Test {
         });
     }
 
+    function _wethRisk() internal pure returns (LendingPool.RiskParams memory) {
+        // borrow up to 75%, liquidatable at 80%, liquidator bonus 7.5%
+        return LendingPool.RiskParams({ltvBps: 7500, liqThresholdBps: 8000, liqBonusBps: 750, borrowEnabled: true});
+    }
+
+    function _usdcRisk() internal pure returns (LendingPool.RiskParams memory) {
+        return LendingPool.RiskParams({ltvBps: 7000, liqThresholdBps: 7500, liqBonusBps: 500, borrowEnabled: true});
+    }
+
     function setUp() public {
         vm.warp(1_800_000_000);
         usdc = new MockERC20("USD Coin (mock)", "USDC", 6);
@@ -45,12 +54,12 @@ contract LendingPoolTest is Test {
         vm.startPrank(owner);
         oracle.setPrice(address(weth), 3000e18);
         oracle.setPrice(address(usdc), 1e18);
-        pool.addAsset(address(weth), 7500, true, _wethModel()); // 75% LTV
-        pool.addAsset(address(usdc), 7000, true, _usdcModel()); // 70% LTV
+        pool.addAsset(address(weth), _wethRisk(), _wethModel());
+        pool.addAsset(address(usdc), _usdcRisk(), _usdcModel());
         vm.stopPrank();
 
         usdc.mint(alice, 100_000e6);
-        usdc.mint(carol, 100_000e6);
+        usdc.mint(carol, 100_000e6); // carol is also our liquidator
         weth.mint(bob, 10e18);
         usdc.mint(bob, 1_000e6); // for repaying (incl. interest)
 
@@ -77,10 +86,13 @@ contract LendingPoolTest is Test {
     // =====================================================================
 
     function test_AddAssetInitialState() public view {
-        (bool supported, bool borrowEnabled, uint16 ltv, uint8 dec) = pool.assetConfig(address(usdc));
+        (bool supported, bool borrowEnabled, uint16 ltv, uint16 lt, uint16 bonus, uint8 dec) =
+            pool.assetConfig(address(usdc));
         assertTrue(supported);
         assertTrue(borrowEnabled);
         assertEq(ltv, 7000);
+        assertEq(lt, 7500);
+        assertEq(bonus, 500);
         assertEq(dec, 6);
         (uint256 li, uint256 bi,,,,) = pool.reserve(address(usdc));
         assertEq(li, RAY); // indices start at 1.0
@@ -90,20 +102,32 @@ contract LendingPoolTest is Test {
     function test_RevertAddAssetNotOwner() public {
         vm.prank(alice);
         vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, alice));
-        pool.addAsset(address(0xBEEF), 5000, true, _usdcModel());
+        pool.addAsset(address(0xBEEF), _usdcRisk(), _usdcModel());
     }
 
     function test_RevertAddAssetTwice() public {
         vm.prank(owner);
         vm.expectRevert(abi.encodeWithSelector(LendingPool.AssetAlreadySupported.selector, address(usdc)));
-        pool.addAsset(address(usdc), 5000, true, _usdcModel());
+        pool.addAsset(address(usdc), _usdcRisk(), _usdcModel());
     }
 
-    function test_RevertLtvTooHigh() public {
+    function test_RevertLtvAboveThreshold() public {
         MockERC20 x = new MockERC20("X", "X", 18);
+        LendingPool.RiskParams memory r = _usdcRisk();
+        r.ltvBps = 8000; // above the 75% liquidation threshold
         vm.prank(owner);
-        vm.expectRevert(abi.encodeWithSelector(LendingPool.InvalidLtv.selector, 9500));
-        pool.addAsset(address(x), 9500, true, _usdcModel());
+        vm.expectRevert(LendingPool.InvalidRiskParams.selector);
+        pool.addAsset(address(x), r, _usdcModel());
+    }
+
+    /// threshold x (1 + bonus) >= 100% would make every liquidation create bad debt.
+    function test_RevertThresholdTimesBonusTooHigh() public {
+        MockERC20 x = new MockERC20("X", "X", 18);
+        LendingPool.RiskParams memory r =
+            LendingPool.RiskParams({ltvBps: 9000, liqThresholdBps: 9500, liqBonusBps: 600, borrowEnabled: true});
+        vm.prank(owner);
+        vm.expectRevert(LendingPool.InvalidRiskParams.selector);
+        pool.addAsset(address(x), r, _usdcModel());
     }
 
     function test_RevertInvalidRateModel() public {
@@ -112,7 +136,7 @@ contract LendingPoolTest is Test {
         m.optimalUtil = RAY; // kink at 100% -> division by zero above it
         vm.prank(owner);
         vm.expectRevert(LendingPool.InvalidRateModel.selector);
-        pool.addAsset(address(x), 5000, true, m);
+        pool.addAsset(address(x), _usdcRisk(), m);
     }
 
     // =====================================================================
@@ -196,7 +220,9 @@ contract LendingPoolTest is Test {
     function test_RevertBorrowDisabledAsset() public {
         _seed();
         vm.prank(owner);
-        pool.setAssetConfig(address(usdc), 7000, false);
+        LendingPool.RiskParams memory r = _usdcRisk();
+        r.borrowEnabled = false;
+        pool.setRiskParams(address(usdc), r);
         vm.prank(bob);
         vm.expectRevert(abi.encodeWithSelector(LendingPool.BorrowNotEnabled.selector, address(usdc)));
         pool.borrow(address(usdc), 100e6);
@@ -379,8 +405,161 @@ contract LendingPoolTest is Test {
     }
 
     // =====================================================================
+    // Health factor & liquidations
+    // =====================================================================
+
+    /// Bob: 1 WETH collateral, borrows the max 2,250 USDC (75% LTV).
+    function _bobAtMaxLtv() internal {
+        _seed();
+        vm.prank(bob);
+        pool.borrow(address(usdc), 2_250e6);
+    }
+
+    function _setEth(uint256 price) internal {
+        vm.prank(owner);
+        oracle.setPrice(address(weth), price);
+    }
+
+    /// LTV (75%) < liquidation threshold (80%): a max-LTV position is still healthy.
+    function test_HealthFactorBufferAtMaxLtv() public {
+        _bobAtMaxLtv();
+        LendingPool.AccountData memory a = pool.getAccountData(bob);
+        assertEq(a.liquidationCollateral, 2_400e18); // $3,000 x 80%
+        assertEq(a.healthFactor, uint256(2_400e18) * 1e18 / 2_250e18); // ~1.067
+        assertGt(a.healthFactor, 1e18);
+    }
+
+    function test_NoDebtMeansInfiniteHealthFactor() public {
+        _seed();
+        assertEq(pool.getAccountData(bob).healthFactor, type(uint256).max);
+    }
+
+    function test_RevertLiquidateHealthy() public {
+        _bobAtMaxLtv();
+        uint256 hf = pool.getAccountData(bob).healthFactor;
+        vm.prank(carol);
+        vm.expectRevert(abi.encodeWithSelector(LendingPool.PositionHealthy.selector, hf));
+        pool.liquidate(address(weth), address(usdc), bob, 1_000e6, true);
+    }
+
+    /// ETH $3,000 -> $2,750: HF = 2,200 / 2,250 = 0.978. Above 0.95, so max 50% per call.
+    function test_LiquidateHalfAboveFullThreshold() public {
+        _bobAtMaxLtv();
+        _setEth(2_750e18);
+        assertLt(pool.getAccountData(bob).healthFactor, 1e18);
+
+        uint256 carolUsdcBefore = usdc.balanceOf(carol);
+        vm.prank(carol);
+        (uint256 covered, uint256 seized) = pool.liquidate(address(weth), address(usdc), bob, type(uint256).max, true);
+
+        assertEq(covered, 1_125e6); // clamped to 50% of 2,250
+        uint256 expectedSeized = uint256(1_125e18) * 10_750 / 10_000 / 2_750; // 0.43977 WETH
+        assertApproxEqAbs(seized, expectedSeized, 1e6);
+
+        // Carol paid USDC, received WETH worth more than she paid (the bonus)
+        assertEq(carolUsdcBefore - usdc.balanceOf(carol), 1_125e6);
+        assertEq(weth.balanceOf(carol), seized);
+        assertGt(seized * 2_750, 1_125e18); // WETH received is worth more than the 1,125 USDC paid
+
+        // Bob: half the debt gone, collateral reduced, and his HF went UP
+        assertEq(pool.debtBalanceOf(address(usdc), bob), 1_125e6);
+        assertEq(pool.supplyBalanceOf(address(weth), bob), 1e18 - seized);
+        assertGt(pool.getAccountData(bob).healthFactor, 1e18);
+    }
+
+    /// ETH -> $2,600: HF = 2,080 / 2,250 = 0.924 < 0.95, so the whole debt can be closed.
+    function test_LiquidateFullBelowThreshold() public {
+        _bobAtMaxLtv();
+        _setEth(2_600e18);
+
+        vm.prank(carol);
+        (uint256 covered, uint256 seized) = pool.liquidate(address(weth), address(usdc), bob, type(uint256).max, true);
+
+        assertEq(covered, 2_250e6);
+        assertEq(pool.debtBalanceOf(address(usdc), bob), 0);
+        // Bob keeps what the liquidator did not need: 1 - 2,250 x 1.075 / 2,600
+        assertApproxEqAbs(pool.supplyBalanceOf(address(weth), bob), 1e18 - seized, 0);
+        assertGt(pool.supplyBalanceOf(address(weth), bob), 0.069e18);
+    }
+
+    /// Liquidator can choose to receive the collateral as a pool position instead of tokens.
+    function test_LiquidateReceiveAsSupplyPosition() public {
+        _bobAtMaxLtv();
+        _setEth(2_750e18);
+
+        vm.prank(carol);
+        (, uint256 seized) = pool.liquidate(address(weth), address(usdc), bob, type(uint256).max, false);
+
+        assertEq(weth.balanceOf(carol), 0);
+        assertApproxEqAbs(pool.supplyBalanceOf(address(weth), carol), seized, 1);
+        assertEq(pool.availableLiquidity(address(weth)), 1e18); // no WETH left the pool
+    }
+
+    /// ETH crashes to $2,000: collateral ($2,000) is worth less than the debt ($2,250).
+    /// The liquidator takes ALL collateral and covers only what it pays for.
+    /// The rest of Bob's debt is BAD DEBT: nothing behind it.
+    function test_BadDebtRemainsAfterCrash() public {
+        _bobAtMaxLtv();
+        _setEth(2_000e18);
+
+        vm.prank(carol);
+        (uint256 covered, uint256 seized) = pool.liquidate(address(weth), address(usdc), bob, type(uint256).max, true);
+
+        assertEq(seized, 1e18); // all of Bob's WETH
+        assertApproxEqAbs(covered, uint256(2_000e6) * 10_000 / 10_750, 1); // ~1,860.47 USDC
+        assertEq(pool.supplyBalanceOf(address(weth), bob), 0);
+
+        uint256 badDebt = pool.debtBalanceOf(address(usdc), bob);
+        assertApproxEqAbs(badDebt, 2_250e6 - covered, 1); // ~389.53 USDC, uncollateralized
+        assertEq(pool.getAccountData(bob).collateralValue, 0);
+    }
+
+    /// No price move needed: interest alone pushes a max-LTV position under water.
+    function test_InterestMakesPositionLiquidatable() public {
+        vm.prank(alice);
+        pool.supply(address(usdc), 2_500e6); // small pool -> 90% utilization -> 4% APR
+        vm.startPrank(bob);
+        pool.supply(address(weth), 1e18);
+        pool.borrow(address(usdc), 2_250e6);
+        vm.stopPrank();
+
+        assertGt(pool.getAccountData(bob).healthFactor, 1e18);
+        vm.warp(block.timestamp + 2 * 365 days); // ~8% more debt > the 6.7% buffer
+        assertLt(pool.getAccountData(bob).healthFactor, 1e18);
+
+        vm.prank(carol);
+        pool.liquidate(address(weth), address(usdc), bob, type(uint256).max, true);
+        assertGt(pool.getAccountData(bob).healthFactor, 1e18);
+    }
+
+    function test_RevertLiquidateWrongDebtAsset() public {
+        _bobAtMaxLtv();
+        _setEth(2_750e18);
+        vm.prank(carol);
+        vm.expectRevert(abi.encodeWithSelector(LendingPool.NoDebt.selector, address(weth)));
+        pool.liquidate(address(usdc), address(weth), bob, 1e18, true); // bob has no WETH debt
+    }
+
+    // =====================================================================
     // Fuzz: solvency and index monotonicity
     // =====================================================================
+
+    /// Any price drop + max liquidation: tracked cash still equals real balances,
+    /// and the debt never goes up.
+    function testFuzz_LiquidationAccounting(uint256 ethPrice, uint256 debtToCover) public {
+        _bobAtMaxLtv();
+        ethPrice = bound(ethPrice, 500e18, 2_800e18);
+        debtToCover = bound(debtToCover, 1e6, 10_000e6);
+        _setEth(ethPrice);
+
+        uint256 debtBefore = pool.debtBalanceOf(address(usdc), bob);
+        vm.prank(carol);
+        pool.liquidate(address(weth), address(usdc), bob, debtToCover, true);
+
+        assertLt(pool.debtBalanceOf(address(usdc), bob), debtBefore);
+        assertEq(usdc.balanceOf(address(pool)), pool.availableLiquidity(address(usdc)));
+        assertEq(weth.balanceOf(address(pool)), pool.availableLiquidity(address(weth)));
+    }
 
     function testFuzz_SolvencyOverTime(uint256 borrowAmt, uint32 dt1, uint32 dt2, uint256 repayAmt) public {
         _seed();
