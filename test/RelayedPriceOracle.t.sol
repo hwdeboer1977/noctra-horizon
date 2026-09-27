@@ -103,17 +103,127 @@ contract RelayedPriceOracleTest is Test {
         assertEq(oracle.getPrice(weth), 3050e18);
     }
 
-    function test_RevertCircuitBreaker() public {
+    // --- circuit breaker ---------------------------------------------------------
+
+    /// Helper: trusted price $3,000 at round 1, then an agreed round 2 at `newAnswer`.
+    function _tripTo(int256 newAnswer) internal returns (bool) {
         _submit(r1, 1, P3000, block.timestamp);
         _submit(r2, 1, P3000, block.timestamp);
+        _submit(r1, 2, newAnswer, block.timestamp);
+        return _submit(r2, 2, newAnswer, block.timestamp);
+    }
 
-        // -25% in one update > 20% breaker
+    function test_SmallMoveDoesNotTrip() public {
+        assertTrue(_tripTo(2500e8)); // -16.7% < 20%
+        assertFalse(oracle.tripped(weth));
+        assertEq(oracle.getPrice(weth), 2500e18);
+    }
+
+    /// Big move: does NOT revert, trips instead; getPrice fails closed immediately.
+    function test_BigMoveTripsAndFailsClosed() public {
+        assertFalse(_tripTo(2250e8)); // -25% > 20%
+
+        assertTrue(oracle.tripped(weth));
+        (uint256 trustedPrice,,) = oracle.latest(weth);
+        assertEq(trustedPrice, 3000e18); // trusted price untouched
+        (uint256 pendingPrice, uint80 pendingRound,) = oracle.pending(weth);
+        assertEq(pendingPrice, 2250e18);
+        assertEq(pendingRound, 2);
+
+        // The old $3,000 is NOT usable any more, even though it is not stale.
+        vm.expectRevert(abi.encodeWithSelector(RelayedPriceOracle.CircuitBreakerActive.selector, weth));
+        oracle.getPrice(weth);
+    }
+
+    function test_TripEmitsEvent() public {
+        _submit(r1, 1, P3000, block.timestamp);
+        _submit(r2, 1, P3000, block.timestamp);
         _submit(r1, 2, 2250e8, block.timestamp);
+        vm.expectEmit(address(oracle));
+        emit RelayedPriceOracle.CircuitBreakerTripped(weth, 3000e18, 2250e18, 2);
+        _submit(r2, 2, 2250e8, block.timestamp);
+    }
+
+    /// While tripped, newer agreed rounds keep updating `pending` for the reviewer.
+    function test_NewerRoundsUpdatePendingWhileTripped() public {
+        _tripTo(2250e8);
+        vm.warp(block.timestamp + 60);
+        _submit(r1, 3, 2200e8, block.timestamp);
+        assertFalse(_submit(r2, 3, 2200e8, block.timestamp));
+
+        (uint256 pendingPrice, uint80 pendingRound,) = oracle.pending(weth);
+        assertEq(pendingPrice, 2200e18);
+        assertEq(pendingRound, 3);
+        assertTrue(oracle.tripped(weth));
+    }
+
+    function test_RevertOlderRoundWhileTripped() public {
+        _tripTo(2250e8);
+        _submit(r1, 2, 2300e8, block.timestamp); // same round id as pending, different answer
         vm.prank(r2);
-        vm.expectRevert(
-            abi.encodeWithSelector(RelayedPriceOracle.DeviationTooLarge.selector, 3000e18, 2250e18, 2000)
-        );
-        oracle.submit(weth, 2, 2250e8, uint64(block.timestamp));
+        vm.expectRevert(); // NotNewer vs pending
+        oracle.submit(weth, 2, 2300e8, SafeCast.toUint64(block.timestamp));
+    }
+
+    /// Review outcome A: the crash was real -> accept pending as trusted.
+    function test_AcceptPending() public {
+        _tripTo(2250e8);
+        vm.prank(owner);
+        oracle.acceptPending(weth);
+
+        assertFalse(oracle.tripped(weth));
+        assertEq(oracle.getPrice(weth), 2250e18);
+        (uint256 pendingPrice,,) = oracle.pending(weth);
+        assertEq(pendingPrice, 0);
+
+        // Normal updates resume, now checked against 2250.
+        _submit(r1, 3, 2300e8, block.timestamp);
+        assertTrue(_submit(r2, 3, 2300e8, block.timestamp));
+        assertEq(oracle.getPrice(weth), 2300e18);
+    }
+
+    /// Review outcome B: the data was wrong -> discard pending, old price usable again.
+    function test_ResetBreaker() public {
+        _tripTo(2250e8);
+        vm.prank(owner);
+        oracle.resetBreaker(weth);
+
+        assertFalse(oracle.tripped(weth));
+        assertEq(oracle.getPrice(weth), 3000e18);
+    }
+
+    function test_RevertAcceptOrResetWhenNotTripped() public {
+        vm.startPrank(owner);
+        vm.expectRevert(abi.encodeWithSelector(RelayedPriceOracle.NotTripped.selector, weth));
+        oracle.acceptPending(weth);
+        vm.expectRevert(abi.encodeWithSelector(RelayedPriceOracle.NotTripped.selector, weth));
+        oracle.resetBreaker(weth);
+        vm.stopPrank();
+    }
+
+    function test_RevertAcceptPendingNotOwner() public {
+        _tripTo(2250e8);
+        vm.prank(attacker);
+        vm.expectRevert(abi.encodeWithSelector(Ownable.OwnableUnauthorizedAccount.selector, attacker));
+        oracle.acceptPending(weth);
+    }
+
+    /// Stablecoin config: a real depeg must reach the pool, so the breaker is loose.
+    function test_UsdcDepegPassesLooseBreaker() public {
+        address usdc = makeAddr("usdc");
+        vm.prank(owner);
+        oracle.configureAsset(usdc, 8, 90_000, 5000); // ~25h max age, 50% breaker
+
+        vm.prank(r1);
+        oracle.submit(usdc, 1, 1e8, SafeCast.toUint64(block.timestamp));
+        vm.prank(r2);
+        oracle.submit(usdc, 1, 1e8, SafeCast.toUint64(block.timestamp));
+
+        vm.prank(r1);
+        oracle.submit(usdc, 2, 0.9e8, SafeCast.toUint64(block.timestamp));
+        vm.prank(r2);
+        assertTrue(oracle.submit(usdc, 2, 0.9e8, SafeCast.toUint64(block.timestamp)));
+        assertEq(oracle.getPrice(usdc), 0.9e18); // pool sees the depeg immediately
     }
 
     function test_RevertZeroOrNegativeAnswer() public {

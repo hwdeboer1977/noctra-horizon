@@ -56,14 +56,19 @@ Chainlink prices from Base, accepted on Horizen once enough relayers agree.
 
 - **Exact-match quorum.** Every honest relayer reads the same Chainlink round, so a price is accepted once `quorum` distinct relayers have submitted identical `(asset, roundId, answer, updatedAt)`. This needs no median.
 - **Vote key.** The key is `keccak256(abi.encode(epoch, asset, roundId, answer, updatedAt))`. `epoch` increments on every relayer or quorum change, so votes cast under an old relayer set never count toward a new one.
-- **Checks on acceptance:**
+- **Checks on acceptance.** Malformed or replayed data reverts:
   - `answer > 0`
   - `updatedAt` is no more than 60 s in the future
-  - the round is strictly newer than the stored one, which prevents replay
-  - the price moves no more than `maxDeviationBps` from the previous accepted price (circuit breaker)
+  - the round is strictly newer than the newest known round (`pending` if tripped, else `latest`), which prevents replay
 - **Scaling.** The Chainlink answer (8 decimals for USD feeds) is scaled to 1e18.
-- **Reads.** `getPrice` reverts with `AssetNotEnabled`, `NoPrice` or `StalePrice` when the Chainlink `updatedAt` is older than the asset's `maxAge`.
-- **Admin (owner, a multisig in production):** `addRelayer`, `removeRelayer`, `setQuorum`, `configureAsset(asset, feedDecimals, maxAge, maxDeviationBps)`.
+- **Circuit breaker (fails closed).** If an agreed round moves the price more than `maxDeviationBps` from the last trusted price, the call does **not** revert. Instead:
+  - the asset is marked `tripped` and the round is parked in `pending`; `latest` stays untouched;
+  - `getPrice` reverts with `CircuitBreakerActive` immediately, so the pool stops using the old price instead of keeping it alive until it goes stale;
+  - newer agreed rounds keep updating `pending`, so the reviewer always sees the latest data;
+  - the owner resolves it with `acceptPending(asset)` (the move was real: pending becomes trusted) or `resetBreaker(asset)` (the data was wrong: pending is discarded and the old price is usable again until it goes stale).
+- **Reads.** `getPrice` reverts with `AssetNotEnabled`, `CircuitBreakerActive`, `NoPrice`, or `StalePrice` when the Chainlink `updatedAt` is older than the asset's `maxAge`. Staleness is measured from Chainlink's `updatedAt`, not from the relay time.
+- **Public state.** `latest(asset)`, `pending(asset)`, `tripped(asset)`, `assetConfig(asset)`, `epoch`, `quorum`, `relayerCount`, `isRelayer(addr)`, `votes(key)`, `hasVoted(key, relayer)`.
+- **Admin (owner, a multisig in production):** `addRelayer`, `removeRelayer`, `setQuorum`, `configureAsset(asset, feedDecimals, maxAge, maxDeviationBps)`, `acceptPending`, `resetBreaker`.
 
 > **Trust model:** the contract cannot see Base. It trusts that at least `quorum` relayers are honest. Run relayer keys on separate infrastructure.
 
@@ -94,7 +99,7 @@ CI (`.github/workflows/test.yml`) runs fmt, build and tests on every push and PR
 | WETH | 8 | 4200 s (~1 h heartbeat + 10 min) | 20 % |
 | USDC | 8 | 90 000 s (~24 h heartbeat + 1 h) | 50 % |
 
-Check both heartbeats on Chainlink's feed pages before you rely on these values.
+Check both heartbeats on Chainlink's feed pages before you rely on these values. `maxAge` must exceed the heartbeat: on a calm market a Chainlink price is legitimately many minutes (ETH) or up to a day (USDC) old. Keep the breaker loose for stablecoins: a depeg is real data the pool must see, not an error.
 
 ```shell
 export PRIVATE_KEY=0x...                 # deployer; becomes the oracle owner
@@ -141,10 +146,9 @@ This is the write side. It pushes Chainlink rounds from Base into `RelayedPriceO
 1. Reads the sequencer and all feeds from Base. If the sequencer is down or in its grace period, it skips the tick.
 2. For each feed, it skips the feed if the oracle already has that round or a newer one, or if this relayer already voted for it. It checks `hasVoted` with the same vote key the contract computes, so a restart never wastes gas.
 3. It simulates `submit()` first, so a revert costs nothing, then sends the transaction and logs whether the vote reached quorum.
+4. It reads `tripped(asset)` and compares against `pending(asset)` while tripped, and logs a warning when a circuit breaker is active on Horizen (owner review needed).
 
 Without `RELAYER_PRIVATE_KEY`, the relayer runs in **dry-run** mode: it logs what it would submit and sends nothing. In production, run one process per relayer key, each on separate infrastructure.
-
-> **Status:** the relayer also reads `tripped(asset)` and `pending(asset)`, which the current `RelayedPriceOracle.sol` does not have yet. Against the contract as it is today, those calls revert. Add them to the contract, or drop them from `backend/src/relay.ts`, before running the relayer live.
 
 ### Feed configuration (`src/config.ts`)
 
@@ -153,7 +157,7 @@ Without `RELAYER_PRIVATE_KEY`, the relayer runs in **dry-run** mode: it logs wha
 | ETH | `0x71041dddad3595F9CEd3DcCFBe3D1F4b0a16Bb70` | `ETH / USD` |
 | USDC | `0x7e860098F58bBFC8648a4311b374B1D669a2bc6B` | `USDC / USD` |
 
-The Base sequencer uptime feed is `0xBCF85224fc0756B9Fa45aA7892530B47e10b6433`, with a grace period of 3600 s.
+The Base sequencer uptime feed is `0xBCF85224fc0756B9Fa45aA7892530B47e10b6433`, with a grace period of 3600 s. **This address is not verified yet** (unlike the two price feeds, it has no `description()` check); confirm it at [docs.chain.link](https://docs.chain.link/data-feeds/l2-sequencer-feeds) (network: Base).
 
 As a safety net, `readFeed()` refuses any feed whose on-chain `description()` doesn't match the expected value. Verify addresses at [docs.chain.link](https://docs.chain.link/data-feeds/price-feeds/addresses) (network: Base).
 
@@ -175,12 +179,23 @@ Run `npm run typecheck` to type-check the backend.
 
 ---
 
+## Known risks and limitations
+
+- **Relayer trust.** If `quorum` relayer keys are compromised, the price is compromised. Keep keys on separate machines; the owner must be a Safe multisig.
+- **Tripped breaker stops the pool.** A tripped ETH breaker blocks borrows and liquidations until the owner acts. The relayer only logs it; alerting (Telegram/Discord) is still to do.
+- **USDC vs USDC.e.** Chainlink's USDC / USD prices native USDC. The pool on Horizen will hold USDC.e (bridged via Stargate), which the oracle cannot see depegging on its own. Mitigate with a lower LTV and supply caps.
+- **Chainlink redistribution terms.** Check Chainlink's terms of use on relaying feed data to another chain before mainnet.
+- **Mocks.** `MockERC20` and `MockPriceOracle` are testnet-only.
+
 ## Roadmap
 
 - [x] Mock ERC20 tokens
 - [x] Lending pool: supply and withdraw
 - [x] Relayed Chainlink price oracle (k-of-n quorum)
 - [x] Backend price server
-- [ ] Relayer: align it with the oracle contract (`tripped` and `pending`)
+- [x] Relayer (Base → Horizen), aligned with the oracle's circuit breaker (`tripped` / `pending`)
+- [x] Circuit breaker that fails closed, with owner review (`acceptPending` / `resetBreaker`)
+- [ ] Alerting when a breaker trips or relayers stop
 - [ ] Lending pool: borrowing, collateral and health factor using `IPriceOracle`
 - [ ] Interest rates and liquidations
+- [ ] v2: trust-minimized prices via storage proofs against Base's block hash (`L1Block` predeploy)
