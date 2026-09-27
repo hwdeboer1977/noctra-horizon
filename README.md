@@ -13,7 +13,9 @@ Horizen has no native Chainlink feeds, so prices are read from Chainlink on **Ba
 └──────────────────────┘     └──────────────────┘     └────────────┬─────────────┘
                                                                    │ IPriceOracle
                                                       ┌────────────▼─────────────┐
-                                                      │ LendingPool (future use) │
+                                                      │ LendingPool              │
+                                                      │   supply · borrow ·      │
+                                                      │   repay · interest       │
                                                       └──────────────────────────┘
 ```
 
@@ -32,13 +34,62 @@ Solidity `0.8.24`, built with [Foundry](https://book.getfoundry.sh/). Dependenci
 
 ### `LendingPool.sol`
 
-Step 2 of the pool: **supply and withdraw only**. It has no borrowing, interest or price checks yet.
+Step 4 of the pool: **supply, withdraw, borrow, repay, with interest**. There are no liquidations yet (see [Known risks](#known-risks-and-limitations)).
 
-- `addAsset(asset)` (owner only) whitelists a token.
-- `supply(asset, amount)` pulls tokens from the caller. Approve the pool first.
-- `withdraw(asset, amount)` returns tokens. Pass `type(uint256).max` to withdraw your full balance.
-- The pool tracks `suppliedBalance[asset][user]` and `totalSupplied[asset]`.
-- Both user functions follow checks-effects-interactions and use `SafeERC20`.
+**User actions** (all `nonReentrant`, tokens moved with `SafeERC20`):
+
+| Function | What it does |
+| --- | --- |
+| `supply(asset, amount)` | Deposits tokens. They earn interest and count as collateral. Approve the pool first. |
+| `withdraw(asset, amount)` | Returns tokens. `type(uint256).max` withdraws everything, including interest up to this block. If you have debt, the withdrawal must keep your debt within your borrow power. |
+| `borrow(asset, amount)` | Borrows an asset with `borrowEnabled`. Afterwards your total debt value must be ≤ your borrow power. |
+| `repay(asset, amount)` | Repays your own debt. Any amount ≥ your debt, including `type(uint256).max`, repays exactly the full debt with interest. |
+| `accrue(asset)` | Anyone can call it to bring the interest indices up to date, e.g. a keeper during quiet periods. |
+
+**Collateral and borrow power.** Each asset has an LTV (`ltvBps`, at most 90 %). Values come from `IPriceOracle.getPrice` and are expressed in USD at 1e18 scale:
+
+```
+borrowPower = Σ supplyValue(asset) × ltv(asset)
+debtValue   = Σ debt(asset) × price(asset)          (debt includes accrued interest)
+```
+
+Example: 1 WETH at $3,000 with 75 % LTV gives $2,250 of borrow power. `borrow` and `withdraw` (while you have debt) revert with `InsufficientCollateral` if `debtValue > borrowPower`.
+
+The pool only asks the oracle for a price when it needs one. If an oracle reverts (stale or tripped), that blocks **risky** actions: borrowing, and withdrawing while in debt. `supply`, `repay`, and withdrawing without debt keep working.
+
+**Interest (scaled balances, no loops over users).**
+
+- Each asset has two indices that start at 1.0 (`RAY` = 1e27). `liquidityIndex` grows with what suppliers earn. `borrowIndex` grows with what borrowers owe.
+- Users store scaled balances (`scaled = amount / index` at the time of the action). Their real balance is `scaled × currentIndex`.
+- Every action first calls `_accrue(asset)`, which moves both indices forward for the time since the last update. Interest is linear between accruals and compounds on each accrual.
+- A **reserve factor** of the interest goes to `treasury`, credited as a supply position. The rest goes to suppliers.
+- Total supply grows by exactly what total debt grows, so claims never exceed cash plus debt. A fuzz test checks this.
+- Rounding always favours the pool: suppliers are rounded down, borrowers up.
+- Utilization uses **tracked** cash (`reserve.cash`), not `balanceOf`, so donating tokens can't manipulate the rates.
+
+**Kinked rate model** (per asset, rates per year in RAY). Utilization is `U = debt / (cash + debt)`:
+
+```
+U ≤ optimal:  borrowRate = base + slope1 × U / optimal
+U > optimal:  borrowRate = base + slope1 + slope2 × (U − optimal) / (1 − optimal)
+supplyRate  = borrowRate × U × (1 − reserveFactor)
+```
+
+**Views:**
+
+- `supplyBalanceOf` and `debtBalanceOf` include interest up to now.
+- `getReserveData(asset)` returns total supply, total debt, utilization, borrow rate and supply rate.
+- `borrowRateAt(asset, U)` returns the rate curve, e.g. for plotting.
+- `getAccountData(user)` returns collateral value, borrow power and debt value.
+- `availableLiquidity`, `assetCount`, and raw `scaledSupplyOf` / `scaledDebtOf` are also available.
+
+**Admin (owner):**
+
+- `addAsset(asset, ltvBps, borrowEnabled, rateModel)`, capped at 10 assets.
+- `setAssetConfig(asset, ltvBps, borrowEnabled)`.
+- `setRateModel(asset, model)`. It accrues first, so the old rates apply to time already elapsed.
+- `setOracle` and `setTreasury`.
+- Rate models are validated: `0 < optimalUtil < 100 %`, `reserveFactor ≤ 100 %`, and a maximum borrow rate of 1000 % APR.
 
 ### `IPriceOracle.sol`
 
@@ -90,6 +141,15 @@ forge fmt --check
 
 CI (`.github/workflows/test.yml`) runs fmt, build and tests on every push and PR.
 
+The suite has 66 tests:
+
+| Test file | Tests | Covers |
+| --- | --- | --- |
+| `LendingPool.t.sol` | 28 | Admin checks, supply and withdraw, LTV limits, liquidity limits, repay, oracle failure only blocking risky actions, the rate curve, one year of interest, late suppliers not getting past interest, interest eroding borrow power, full exit after interest, and a solvency fuzz test. |
+| `RelayedPriceOracle.t.sol` | 27 | Quorum and exact-match voting, replay protection, the circuit breaker (trip, pending updates, accept or reset), a USDC depeg under a loose breaker, staleness, and relayer-set changes. |
+| `MockPriceOracle.t.sol` | 6 | Setting and updating prices, events, value calculation across decimals, owner-only access, reverting on an unset price. |
+| `MockERC20.t.sol` | 5 | Metadata and decimals, minting, transfers, approve and `transferFrom`. |
+
 ### Deploy to Horizen testnet
 
 `script/DeployOracle.s.sol` deploys mock WETH, mock USDC and a `RelayedPriceOracle`. It then registers the relayers, sets the quorum and configures both assets:
@@ -109,6 +169,8 @@ forge script script/DeployOracle.s.sol --rpc-url horizen_testnet --broadcast
 ```
 
 The RPC aliases `horizen_testnet` and `horizen_mainnet` are defined in `foundry.toml`. The script logs the three deployed addresses. Copy them into `backend/.env`.
+
+> The script does **not** deploy `LendingPool` yet. To do that you need a constructor call `LendingPool(owner, oracle, treasury)` plus `addAsset` for WETH and USDC with their LTVs and rate models. The rate models in `test/LendingPool.t.sol` are a starting point.
 
 ---
 
@@ -182,7 +244,9 @@ Run `npm run typecheck` to type-check the backend.
 ## Known risks and limitations
 
 - **Relayer trust.** If `quorum` relayer keys are compromised, the price is compromised. Keep keys on separate machines; the owner must be a Safe multisig.
-- **Tripped breaker stops the pool.** A tripped ETH breaker blocks borrows and liquidations until the owner acts. The relayer only logs it; alerting (Telegram/Discord) is still to do.
+- **No liquidations yet.** Interest makes debt grow, and prices move, so positions can drift past their borrow power. Nothing closes them yet, which means the pool can build up bad debt. Lowering an asset's LTV with `setAssetConfig` can also push existing positions over the limit immediately.
+- **Tripped breaker stops the pool.** A tripped breaker blocks borrows, and withdrawals by indebted users, for every position that touches that asset, until the owner acts. Liquidations will be blocked too once they exist. The relayer only logs it; alerting (Telegram/Discord) is still to do.
+- **Standard ERC20s only.** The pool assumes `transferFrom` delivers the full amount. Fee-on-transfer and rebasing tokens would break the `cash` accounting, so don't list them.
 - **USDC vs USDC.e.** Chainlink's USDC / USD prices native USDC. The pool on Horizen will hold USDC.e (bridged via Stargate), which the oracle cannot see depegging on its own. Mitigate with a lower LTV and supply caps.
 - **Chainlink redistribution terms.** Check Chainlink's terms of use on relaying feed data to another chain before mainnet.
 - **Mocks.** `MockERC20` and `MockPriceOracle` are testnet-only.
@@ -195,7 +259,10 @@ Run `npm run typecheck` to type-check the backend.
 - [x] Backend price server
 - [x] Relayer (Base → Horizen), aligned with the oracle's circuit breaker (`tripped` / `pending`)
 - [x] Circuit breaker that fails closed, with owner review (`acceptPending` / `resetBreaker`)
+- [x] Lending pool: borrowing and repaying, collateral with per-asset LTV using `IPriceOracle`
+- [x] Interest: kinked rate model, scaled balances, reserve factor to the treasury
+- [ ] Liquidations (liquidation threshold separate from LTV, liquidation bonus)
+- [ ] Deploy script for `LendingPool`
+- [ ] Supply and borrow caps
 - [ ] Alerting when a breaker trips or relayers stop
-- [ ] Lending pool: borrowing, collateral and health factor using `IPriceOracle`
-- [ ] Interest rates and liquidations
 - [ ] v2: trust-minimized prices via storage proofs against Base's block hash (`L1Block` predeploy)
