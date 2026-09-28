@@ -442,6 +442,9 @@ contract LendingPool is Ownable, ReentrancyGuard {
 
         // 4. Scaled amounts (rounding in the pool's favour)
         v.debtScaledBurn = v.debtCovered >= userDebt ? v.userDebtScaled : _rayDivDown(v.debtCovered, borrowIndex);
+        // A dust repay (e.g. 1 wei once borrowIndex > 1) rounds down to 0 scaled debt burned.
+        // Without this check the borrower would lose collateral while their debt stays the same.
+        if (v.debtScaledBurn == 0) revert ZeroAmount();
         v.collScaledMove =
             v.collateralSeized == userColl ? v.userCollScaled : _rayDivUp(v.collateralSeized, liquidityIndex);
         if (v.collScaledMove > v.userCollScaled) v.collScaledMove = v.userCollScaled;

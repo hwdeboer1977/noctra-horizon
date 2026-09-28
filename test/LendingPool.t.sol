@@ -532,6 +532,17 @@ contract LendingPoolTest is Test {
         assertGt(pool.getAccountData(bob).healthFactor, 1e18);
     }
 
+    /// Once borrowIndex > 1, repaying 1 wei burns 0 scaled debt (rounded down).
+    /// The pool must refuse, otherwise the borrower loses collateral for nothing.
+    function test_RevertLiquidateDustBurnsNoDebt() public {
+        _bobAtMaxLtv();
+        vm.warp(block.timestamp + 30 days);
+        _setEth(2_750e18);
+        vm.prank(carol);
+        vm.expectRevert(LendingPool.ZeroAmount.selector);
+        pool.liquidate(address(weth), address(usdc), bob, 1, false);
+    }
+
     function test_RevertLiquidateWrongDebtAsset() public {
         _bobAtMaxLtv();
         _setEth(2_750e18);
