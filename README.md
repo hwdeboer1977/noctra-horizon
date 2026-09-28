@@ -23,7 +23,7 @@ Horizen has no native Chainlink feeds, so prices are read from Chainlink on **Ba
 | Path | What it holds |
 | --- | --- |
 | `src/` | Solidity contracts (Foundry) |
-| `test/` | Forge tests |
+| `test/` | Forge unit and fuzz tests; `test/invariant/` holds the invariant suite (handler + properties) |
 | `script/` | Deployment script (`DeployOracle.s.sol`) and the local anvil liquidation demo (`LiquidationDemo.s.sol`) |
 | `backend/` | TypeScript price server, relayer and liquidator bot (viem) |
 | `AUDIT.md` | Security review of the liquidation logic, with proof-of-concept tests |
@@ -51,6 +51,7 @@ Step 5 of the pool: **supply, withdraw, borrow, repay with interest, and liquida
   - Close factor: at most 50% of the debt per call, or 100% once the health factor is below 0.95.
   - If the collateral is not enough, the liquidator takes all of it and covers proportionally less debt.
   - `receiveUnderlying = false` delivers the collateral as a supply position instead of tokens (useful when the collateral is lent out).
+  - A liquidation whose repayment rounds down to 0 scaled debt (a dust amount such as 1 wei once `borrowIndex > 1`) reverts with `ZeroAmount`. Otherwise the borrower would lose collateral while their debt stays the same. Found by the invariant suite; regression test `test_RevertLiquidateDustBurnsNoDebt`.
 - `supply` / `withdraw` / `borrow` / `repay`: `borrow`, and `withdraw` while you have debt, must keep your debt within your LTV borrow power. `type(uint256).max` withdraws or repays everything including interest. Repaying never needs a price.
 - `accrue(asset)`: anyone can bring an asset's interest indices up to date (e.g. a keeper in quiet periods).
 - Other admin functions: `setOracle` and `setTreasury`. Like `setRiskParams` and `setRateModel`, they take effect immediately (see [Known risks](#known-risks-and-limitations)).
@@ -109,6 +110,36 @@ forge fmt --check
 ```
 
 CI (`.github/workflows/test.yml`) runs fmt, build and tests on every push and PR.
+
+#### Invariant tests
+
+`test/invariant/` checks properties that must hold after **any** sequence of actions, not just hand-written scenarios. The fuzzer calls the handler (`LendingPoolHandler.sol`) in random order with random inputs across 4 actors and both assets: supply, withdraw, borrow, repay, liquidate, ETH price moves ($500 to $6,000), time jumps (up to 30 days) and accrue. After every call it checks:
+
+| Invariant | Property |
+| --- | --- |
+| `CashMatchesBalance` | Tracked `cash` equals the pool's real token balance |
+| `ScaledBalancesSumToTotals` | Σ user scaled balances (incl. treasury) equals the reserve totals, exactly |
+| `Solvency` | `cash + totalDebt ≥ totalSupply` (2 wei rounding slack). Counts bad debt as an asset: it proves the books balance, not that all debt is collectable |
+| `IndicesMonotonic` | Liquidity and borrow indices start at 1.0 and never decrease |
+| `BorrowPowerEnforced` | No borrow or withdraw leaves a user with debt above borrow power |
+| `LiquidationSane` | Every liquidation reduces the borrower's debt and collateral, and the liquidator receives at least the value repaid (minus one collateral base unit of rounding) |
+| `UtilizationBounded` | Utilization never exceeds 100% |
+
+```shell
+forge test --mc LendingPoolInvariantTest -vv                                  # 256 runs x 100 calls
+FOUNDRY_INVARIANT_RUNS=2000 forge test --mc LendingPoolInvariantTest          # longer run
+```
+
+`foundry.toml` needs:
+
+```toml
+[invariant]
+runs = 256
+depth = 100
+fail_on_revert = false   # the handler's rejected calls (e.g. borrow above LTV) are expected
+```
+
+`afterInvariant` logs how often each action ran. Successful liquidations are relatively rare (about 67 per 10,000 calls in one measurement), so use the longer run before trusting a change to the liquidation logic.
 
 ### Deploy to Horizen testnet
 
@@ -248,15 +279,22 @@ See [`AUDIT.md`](AUDIT.md) for the full security review, severities and proof-of
 
 - **Relayer trust.** If `quorum` relayer keys are compromised, the price is compromised. Keep keys on separate machines; the owner must be a Safe multisig.
 - **Oracle down = pool frozen for affected users** (audit H-2). A tripped breaker or a stale price blocks borrows **and liquidations** for every user holding that asset, even when a liquidation would use other assets. The breaker trips on large moves, exactly when liquidations are needed. For the MVP there is no alerting: the relayer only logs it, so watch the relayer logs.
-- **Bad debt** (audit H-1). If collateral falls below the debt before liquidators act, the leftover debt stays with nothing behind it. It keeps accruing interest, which inflates supplier and treasury balances that can never be paid out. Withdrawals are first-come, first-served, so the last suppliers to exit take the loss. There is no write-off or reserve fund yet.
+- **Bad debt** (audit H-1). If collateral falls below the debt before liquidators act, the leftover debt stays with nothing behind it:
+  - It can never be cleared: with no collateral left, a further liquidation reverts with `ZeroAmount`.
+  - It keeps accruing interest. That raises the liquidity index and the treasury's balance with nothing behind them, and keeps utilization (and so every borrower's rate) artificially high.
+  - Supplier and treasury claims therefore exceed what the pool can collect. Withdrawals are first-come, first-served, so early withdrawers (the treasury included) are paid in full and the last suppliers to exit take the loss.
+  - There is no write-off or reserve fund yet. The `Solvency` invariant still passes, because it counts bad debt as an asset.
 - **Non-collateral can be seized, and the bonus is uncapped** (audit M-1). `liquidate` accepts any supplied asset as `collateralAsset`, including one with a liquidation threshold of 0. For such assets the bonus validation allows up to 655 %.
 - **Instant admin changes** (audit M-2). `setOracle`, `setRiskParams` and `setRateModel` apply immediately. A compromised owner key could make every position liquidatable in one block. A timelock is needed before mainnet.
-- **No emergency pause** for supply and borrow.
+- **No supply or borrow caps.** A position too large to sell on Horizen's thin DEX liquidity will not be liquidated profitably and turns into bad debt. Launch with small caps and raise them over time.
+- **No emergency pause** for supply and borrow. A guardian that can pause supply and borrow while leaving repay and liquidate open is standard.
+- **No minimum borrow.** Positions below the gas cost of liquidating them will never be liquidated.
 - **Standard ERC20s only.** Fee-on-transfer and rebasing tokens break the pool's `cash` bookkeeping.
 - **USDC vs USDC.e.** Chainlink's USDC / USD prices native USDC. The pool on Horizen will hold USDC.e (bridged via Stargate), which the oracle cannot see depegging on its own. Mitigate with a lower LTV and supply caps.
 - **Chainlink redistribution terms.** Check Chainlink's terms of use on relaying feed data to another chain before mainnet.
 - **Liquidation needs liquidators and liquidity.** Someone must run a bot, and the seized collateral must be sellable on Horizen. Thin DEX liquidity means a higher bonus or lower LTVs. Small positions may never be worth liquidating.
 - **Mocks.** `MockERC20` and `MockPriceOracle` are testnet-only.
+- **No external audit.** `AUDIT.md` is an internal review. Get an external audit before any mainnet deployment with real funds.
 
 ## Roadmap
 
@@ -272,8 +310,15 @@ See [`AUDIT.md`](AUDIT.md) for the full security review, severities and proof-of
 - [x] Liquidations: liquidation threshold, health factor, close factor, bonus
 - [x] Liquidation bot (backend), tested end-to-end on anvil
 - [x] Security review of liquidations ([`AUDIT.md`](AUDIT.md))
+- [x] Invariant test suite for the pool (`test/invariant/`)
+- [x] Fix: dust liquidation that seized collateral without reducing debt
 - [ ] Bad-debt handling (write-off / reserve fund)
 - [ ] Audit fixes: reject zero-threshold collateral, cap the bonus, liquidations during oracle outages, timelock
+- [ ] Supply and borrow caps per asset
+- [ ] Emergency pause (guardian) for supply and borrow; repay and liquidate stay open
+- [ ] Minimum borrow size
+- [ ] `RelayedPriceOracle` test suite on par with the pool (unit, fuzz, invariant)
 - [ ] Liquidator bot fixes: `Promise.allSettled`, no overlapping ticks, gas pricing
 - [ ] Deploy pool to Horizen testnet with `RelayedPriceOracle`
+- [ ] External audit before mainnet
 - [ ] v2: trust-minimized prices via storage proofs against Base's block hash (`L1Block` predeploy)
