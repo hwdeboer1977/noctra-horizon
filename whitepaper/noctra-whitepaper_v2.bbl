@@ -1,0 +1,70 @@
+\begin{thebibliography}{11}
+\providecommand{\natexlab}[1]{#1}
+\providecommand{\url}[1]{\texttt{#1}}
+\expandafter\ifx\csname urlstyle\endcsname\relax
+  \providecommand{\doi}[1]{doi: #1}\else
+  \providecommand{\doi}{doi: \begingroup \urlstyle{rm}\Url}\fi
+
+\bibitem[{Aave}(2022)]{aavev3}
+{Aave}.
+\newblock {Aave Protocol v3 Technical Paper}.
+\newblock \url{https://github.com/aave/aave-v3-core}, 2022.
+
+\bibitem[{Chainlink}(2026)]{chainlink}
+{Chainlink}.
+\newblock {Chainlink Data Feeds Documentation}.
+\newblock \url{https://docs.chain.link/data-feeds}, 2026.
+
+\bibitem[de~Boer(2026{\natexlab{a}})]{zkperp}
+Henk-Wim de~Boer.
+\newblock {ZKPerp: Privacy-Preserving Perpetuals on Aleo, Whitepaper v5.1}.
+\newblock
+  \url{https://hwdeboer1977.github.io/ZKPerp/zkperp-whitepaper-v5.html}, May
+  2026{\natexlab{a}}.
+
+\bibitem[de~Boer(2026{\natexlab{b}})]{zkperpapp}
+Henk-Wim de~Boer.
+\newblock {ZKPerp app on Aleo testnet}.
+\newblock \url{https://zk-perp.vercel.app/}, 2026{\natexlab{b}}.
+
+\bibitem[de~Boer(2026{\natexlab{c}})]{zkperpcode}
+Henk-Wim de~Boer.
+\newblock {ZKPerp source code}.
+\newblock \url{https://github.com/hwdeboer1977/ZKPerp}, 2026{\natexlab{c}}.
+
+\bibitem[{Horizen}(2026{\natexlab{a}})]{horizen2026}
+{Horizen}.
+\newblock {Practical Privacy Has a Home, Part 2}.
+\newblock Via Bitget News,
+  \url{https://www.bitget.com/news/detail/12560605521153}, July
+  2026{\natexlab{a}}.
+
+\bibitem[{Horizen}(2026{\natexlab{b}})]{horizenprivacy}
+{Horizen}.
+\newblock {Privacy Tools}.
+\newblock \url{https://docs.horizen.io/horizen-chain/privacy-tools},
+  2026{\natexlab{b}}.
+
+\bibitem[{Horizen}(2026{\natexlab{c}})]{horizenroadmap}
+{Horizen}.
+\newblock {Horizen Roadmap}.
+\newblock \url{https://www.horizen.io/roadmap}, 2026{\natexlab{c}}.
+
+\bibitem[{Horizen Labs}(2026)]{veladocs}
+{Horizen Labs}.
+\newblock {Vela: Introduction}.
+\newblock \url{https://docs.horizen.io/vela/introduction}, 2026.
+
+\bibitem[{The Block}(2025)]{theblock2025}
+{The Block}.
+\newblock {Vintage privacy project Horizen relaunches as Layer 3 on Base}.
+\newblock
+  \url{https://www.theblock.co/news/ecosystems/2025-12-09-privacy-horizen-launches-layer-3-base-mainnet-381846},
+  December 2025.
+
+\bibitem[{zkVerify}(2026)]{zkverify}
+{zkVerify}.
+\newblock {zkVerify Documentation}.
+\newblock \url{https://docs.zkverify.io}, 2026.
+
+\end{thebibliography}
